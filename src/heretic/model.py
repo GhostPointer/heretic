@@ -8,6 +8,7 @@ from typing import Any, Type, cast
 
 import bitsandbytes as bnb
 import torch
+import torch.nn as nn
 import torch.linalg as LA
 import torch.nn.functional as F
 from peft import LoraConfig, PeftModel, get_peft_model
@@ -37,6 +38,15 @@ def get_model_class(
     model: str,
 ) -> Type[AutoModelForImageTextToText] | Type[AutoModelForCausalLM]:
     configs = PretrainedConfig.get_config_dict(model)
+
+    # Prioritize the architecture defined in the config. If it explicitly
+    # claims to be a CausalLM, trust that over the presence of vision_config.
+    # Some text-only models (e.g. MiniMax M2.5) or VL models used in text mode
+    # may contain vision_config but should still be loaded as CausalLM.
+    for config in configs:
+        if isinstance(config, dict) and "architectures" in config:
+            if any("CausalLM" in arch for arch in config["architectures"]):
+                return AutoModelForCausalLM
 
     if any([("vision_config" in config) for config in configs]):
         return AutoModelForImageTextToText
@@ -116,10 +126,18 @@ class Model:
                 if self.trusted_models.get(settings.model) is None:
                     self.trusted_models[settings.model] = True
 
+                # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
+                self._convert_fp8_to_bf16()
+
+                # Some trust_remote_code models wrap forward() with decorators
+                # that reject standard HuggingFace kwargs (e.g., input_ids).
+                self._unwrap_restrictive_forward_decorators()
+
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
                 # (https://github.com/meta-llama/llama/issues/380).
-                self.generate(
+                # It also validates the FP8 to BF16 conversion if applicable.
+                inputs, outputs = self.generate(
                     [
                         Prompt(
                             system=settings.system_prompt,
@@ -128,6 +146,13 @@ class Model:
                     ],
                     max_new_tokens=1,
                 )
+
+                if settings.print_responses:
+                    response = self.tokenizer.decode(
+                        outputs[0, cast(Tensor, inputs["input_ids"]).shape[1] :],
+                        skip_special_tokens=True,
+                    )
+                    print(f"\n* Sanity check response: {response}")
             except Exception as error:
                 self.model = None  # ty:ignore[invalid-assignment]
                 empty_cache()
@@ -161,14 +186,20 @@ class Model:
         assert isinstance(self.model, PreTrainedModel)
 
         # Always use LoRA adapters for abliteration (faster reload, no weight modification).
-        # We use the leaf names (e.g. "o_proj") as target modules.
-        # This may cause LoRA adapters to be attached to unrelated modules (e.g. "conv.o_proj"),
-        # but this is harmless as we only abliterate the modules we target in `abliterate()`,
-        # leaving the others at their default (identity) state.
-        # NOTE: This will need to be updated when hybrid layer support (#43) is merged.
-        target_modules = [
-            comp.split(".")[-1] for comp in self.get_abliterable_components()
-        ]
+        # Collect the actual leaf module names from get_layer_modules() so that PEFT
+        # targets the right modules regardless of architecture. For example, MoE models
+        # may use "w2" instead of "down_proj" for their expert down-projection.
+        # Unrelated modules with the same leaf name (e.g. "conv.o_proj") will also get
+        # LoRA adapters, but this is harmless as we only abliterate the modules we
+        # target in abliterate(), leaving the others at their default (identity) state.
+        module_id_to_name = {id(mod): name for name, mod in self.model.named_modules()}
+        target_modules = set()
+        for modules in self.get_layer_modules(0).values():
+            for module in modules:
+                full_name = module_id_to_name.get(id(module))
+                if full_name is not None:
+                    target_modules.add(full_name.rsplit(".", 1)[-1])
+        target_modules = list(target_modules)
 
         if self.settings.row_normalization != RowNormalization.FULL:
             # Rank 1 is sufficient for directional ablation without renormalization.
@@ -193,6 +224,155 @@ class Model:
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
+
+    def _convert_fp8_to_bf16(self) -> None:
+        """
+        Converts FP8Linear layers to standard BFloat16 Linear layers with proper scaling.
+
+        Some models (e.g., MiniMax M2.5) use Float8_e4m3fn quantization which requires
+        special handling. This method identifies FP8Linear layers, applies their scale
+        factors (including block-wise scaling), and converts them to standard BF16 layers.
+        """
+        fp8_module_names = [
+            name
+            for name, module in self.model.named_modules()
+            if "FP8Linear" in module.__class__.__name__
+        ]
+
+        if not fp8_module_names:
+            return
+
+        print(f"* Converting {len(fp8_module_names)} FP8 layers to BF16...")
+
+        # Identify the scale attribute name by inspecting the first module.
+        scale_attr = None
+        first_module = self.model.get_submodule(fp8_module_names[0])
+        for attr in ["weight_scale", "scale", "w_scale", "weight_scale_inv"]:
+            if hasattr(first_module, attr):
+                scale_attr = attr
+                break
+
+        if scale_attr is None:
+            print("[yellow]Warning: no scale attribute found on FP8 modules, weights may be inaccurate[/]")
+
+        # Determine if the scale needs to be inverted for dequantization.
+        # Most attributes store the dequantization factor directly (multiply to dequant).
+        # "weight_scale_inv" is ambiguous across libraries:
+        #   - transformer_engine, msamp: it IS the dequant factor (multiply)
+        #   - HuggingFace finegrained_fp8: it IS the dequant factor (multiply)
+        #     (the Triton kernel does: accumulator += dot(a, b) * a_s * b_s)
+        #   - Other conventions: it may be 1/dequant_factor (need to invert)
+        invert_scale = False
+        if scale_attr == "weight_scale_inv":
+            module_origin = first_module.__class__.__module__ or ""
+            if not any(
+                lib in module_origin
+                for lib in ("transformer_engine", "msamp", "finegrained_fp8", "transformers")
+            ):
+                invert_scale = True
+
+        for name in fp8_module_names:
+            module = self.model.get_submodule(name)
+            new_layer = nn.Linear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                dtype=torch.bfloat16,
+                device=module.weight.device,
+            )
+
+            with torch.no_grad():
+                # Cast FP8 weights to float32 for processing.
+                weight_data = module.weight.data.float()
+
+                # Apply scaling if available.
+                if scale_attr and hasattr(module, scale_attr):
+                    scale = getattr(module, scale_attr).float().to(weight_data.device)
+                    if invert_scale:
+                        scale = 1.0 / scale
+
+                    # Handle block-wise scaling (e.g., 128x128 blocks).
+                    if scale.dim() == 2 and weight_data.dim() == 2 and scale.shape != weight_data.shape:
+                        block_rows = math.ceil(weight_data.shape[0] / scale.shape[0])
+                        block_cols = math.ceil(weight_data.shape[1] / scale.shape[1])
+
+                        # Expand scale to match weight shape.
+                        scale_expanded = torch.repeat_interleave(scale, block_rows, dim=0)
+                        scale_expanded = torch.repeat_interleave(scale_expanded, block_cols, dim=1)
+
+                        # Crop if dimensions don't align perfectly.
+                        if scale_expanded.shape != weight_data.shape:
+                            scale_expanded = scale_expanded[:weight_data.shape[0], :weight_data.shape[1]]
+
+                        weight_data = weight_data * scale_expanded
+                    else:
+                        # Scalar or element-wise scaling (broadcasting handles both).
+                        weight_data = weight_data * scale
+
+                # Store as BF16.
+                new_layer.weight.copy_(weight_data.to(torch.bfloat16))
+
+                if module.bias is not None:
+                    if module.bias.data.is_floating_point() and module.bias.data.element_size() == 1:
+                        print(f"[yellow]Warning: bias of {name} appears to be FP8 and may need scaling[/]")
+                    new_layer.bias.copy_(module.bias.data.float().to(torch.bfloat16))
+
+            # Replace the FP8 layer with the new BF16 layer.
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = self.model.get_submodule(parent_name)
+            else:
+                child_name = name
+                parent = self.model
+            setattr(parent, child_name, new_layer)
+
+        empty_cache()
+        print("* FP8 to BF16 conversion complete")
+
+    def _unwrap_restrictive_forward_decorators(self) -> None:
+        """
+        Some models with trust_remote_code (e.g., MiniMax M2.5) wrap forward()
+        with decorators like check_model_inputs whose wrapper function rejects
+        standard HuggingFace kwargs (input_ids, attention_mask, etc.).
+        Detect and unwrap such decorators to allow normal generation.
+        """
+        for model_obj in [self.model, getattr(self.model, "model", None)]:
+            if model_obj is None:
+                continue
+
+            forward = getattr(type(model_obj), "forward", None)
+            if forward is None:
+                continue
+
+            qualname = getattr(forward, "__qualname__", "")
+            if "check_model_inputs" not in qualname:
+                continue
+
+            # Try __wrapped__ first (set by functools.wraps).
+            if hasattr(forward, "__wrapped__"):
+                type(model_obj).forward = forward.__wrapped__
+                print("* Unwrapped check_model_inputs decorator from forward()")
+                continue
+
+            # Fallback: extract the original function from the closure.
+            # Decorators that don't use functools.wraps typically capture the
+            # original function in their closure cells.
+            if hasattr(forward, "__closure__") and forward.__closure__:
+                import types
+
+                for cell in forward.__closure__:
+                    try:
+                        cell_contents = cell.cell_contents
+                    except ValueError:
+                        continue
+                    if isinstance(cell_contents, types.FunctionType) and cell_contents is not forward:
+                        # Verify this looks like the real forward method
+                        # (its qualname should contain "forward" but not "check_model_inputs").
+                        inner_qualname = getattr(cell_contents, "__qualname__", "")
+                        if "forward" in inner_qualname and "check_model_inputs" not in inner_qualname:
+                            type(model_obj).forward = cell_contents
+                            print("* Unwrapped check_model_inputs decorator from forward() (via closure)")
+                            break
 
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
@@ -236,12 +416,20 @@ class Model:
 
             # Load base model in full precision on CPU to avoid VRAM issues
             print("* Loading base model on CPU (this may take a while)...")
-            base_model = get_model_class(self.settings.model).from_pretrained(
+            original_model = self.model
+            self.model = get_model_class(self.settings.model).from_pretrained(
                 self.settings.model,
-                torch_dtype=self.model.dtype,
+                torch_dtype=original_model.dtype,
                 device_map="cpu",
                 trust_remote_code=self.trusted_models.get(self.settings.model),
             )
+
+            # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
+            self._convert_fp8_to_bf16()
+            self._unwrap_restrictive_forward_decorators()
+
+            base_model = self.model
+            self.model = original_model
 
             # Apply LoRA adapters to the CPU model
             print("* Applying LoRA adapters...")
@@ -304,6 +492,10 @@ class Model:
             trust_remote_code=self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         )
+
+        # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
+        self._convert_fp8_to_bf16()
+        self._unwrap_restrictive_forward_decorators()
 
         self._apply_lora()
 
@@ -425,6 +617,45 @@ class Model:
                     layer_refusal_direction = refusal_direction
 
                 for module in modules:
+                    # Defensive fallback for modules without LoRA adapters.
+                    # Under normal flow, _convert_fp8_to_bf16() + _apply_lora() wraps
+                    # all targeted modules, so this should not trigger. It exists as a
+                    # safeguard in case PEFT fails to match a module by name.
+                    if not hasattr(module, "base_layer"):
+                        # Direct weight modification fallback (slower, triggers reload).
+                        # Unlike the LoRA path which reads from immutable base_layer weights,
+                        # this modifies weights in-place. A second call without reload would
+                        # compound on already-modified weights, producing wrong results.
+                        assert not self.needs_reload, (
+                            "Module without LoRA adapter has already been directly modified. "
+                            "Call reset_model() before re-abliterating."
+                        )
+                        self.needs_reload = True
+                        v = layer_refusal_direction.to(module.weight.device)
+                        W = module.weight.data.float()
+
+                        if self.settings.row_normalization == RowNormalization.FULL:
+                            W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
+                            W_norm = F.normalize(W, p=2, dim=1)
+                            proj = v @ W_norm
+                            delta = -weight * torch.outer(v, proj)
+                            W_adjusted = W_norm + delta
+                            W_adjusted = F.normalize(W_adjusted, p=2, dim=1)
+                            W = W_adjusted * W_row_norms
+                        elif self.settings.row_normalization == RowNormalization.PRE:
+                            W_row_norms = LA.vector_norm(W, dim=1, keepdim=True)
+                            W_norm = F.normalize(W, p=2, dim=1)
+                            proj = v @ W_norm
+                            delta = -weight * torch.outer(v, proj)
+                            W = W + W_row_norms * delta
+                        else:
+                            proj = v @ W
+                            delta = -weight * torch.outer(v, proj)
+                            W = W + delta
+
+                        module.weight.data = W.to(module.weight.dtype)
+                        continue
+
                     # FIXME: This cast is potentially invalid, because the program logic
                     #        does not guarantee that the module is of type Linear, and in fact
                     #        the retrieved modules might not conform to the interface assumed
@@ -603,29 +834,88 @@ class Model:
     def get_residuals(self, prompts: list[Prompt]) -> Tensor:
         # We only generate one token, and we return the residual vectors
         # at that token position, for each prompt and layer.
-        _, outputs = self.generate(
-            prompts,
-            max_new_tokens=1,
-            output_hidden_states=True,
-            return_dict_in_generate=True,
-        )
+        layers = self.get_layers()
+        collected: list[Tensor] = []
+        hooks = []
+        # Number of entries expected from the prefill pass:
+        # 1 embedding (pre-hook) + len(layers) layer outputs (post-hooks).
+        n_expected = len(layers) + 1
+        # Flag to stop collecting after the first complete forward pass,
+        # preventing decode steps or chunked prefill from corrupting the list.
+        collecting = True
 
-        # This cast is valid because GenerateDecoderOnlyOutput is the return type
-        # of model.generate with return_dict_in_generate=True.
-        outputs = cast(GenerateDecoderOnlyOutput, outputs)
+        # Register forward hooks on decoder layers to capture hidden states.
+        # This is needed as a fallback for models that use OutputRecorder
+        # (set up by check_model_inputs) instead of manually collecting
+        # hidden states in their forward method (e.g., MiniMax M2.5).
+        # Use the first layer's device as the common device for collected tensors.
+        collect_device = next(layers[0].parameters()).device
 
-        # Hidden states for the first (only) generated token.
-        # This cast is valid because we passed output_hidden_states=True above.
-        hidden_states = cast(tuple[tuple[FloatTensor]], outputs.hidden_states)[0]
+        # Pre-hook on first layer captures the embedding output.
+        def pre_hook(module: Module, args: tuple[Any, ...]) -> None:
+            if collecting:
+                collected.append(args[0][:, -1, :].detach().to(collect_device))
 
-        # The returned tensor has shape (prompt, layer, component).
-        residuals = torch.stack(
-            # layer_hidden_states has shape (prompt, position, component),
-            # so this extracts the hidden states at the end of each prompt,
-            # and stacks them up over the layers.
-            [layer_hidden_states[:, -1, :] for layer_hidden_states in hidden_states],
-            dim=1,
-        )
+        hooks.append(layers[0].register_forward_pre_hook(pre_hook))
+
+        # Post-hooks capture each layer's output.
+        def make_post_hook() -> Any:
+            def post_hook(module: Module, args: tuple[Any, ...], output: Any) -> None:
+                nonlocal collecting
+                if not collecting:
+                    return
+                # Layer output may be a bare tensor, a tuple, or a dataclass
+                # (e.g. BaseModelOutputWithPast) that supports [0] indexing.
+                hs = output if isinstance(output, torch.Tensor) else output[0]
+                collected.append(hs[:, -1, :].detach().to(collect_device))
+                # Stop collecting once we have all prefill entries.
+                if len(collected) >= n_expected:
+                    collecting = False
+
+            return post_hook
+
+        for layer in layers:
+            hooks.append(layer.register_forward_hook(make_post_hook()))
+
+        try:
+            _, outputs = self.generate(
+                prompts,
+                max_new_tokens=1,
+                output_hidden_states=True,
+                return_dict_in_generate=True,
+            )
+
+            # This cast is valid because GenerateDecoderOnlyOutput is the return type
+            # of model.generate with return_dict_in_generate=True.
+            outputs = cast(GenerateDecoderOnlyOutput, outputs)
+
+            # Check if generate() returned usable hidden states.
+            # Some models return a non-None tuple whose elements are None.
+            has_hidden_states = (
+                outputs.hidden_states is not None
+                and len(outputs.hidden_states) > 0
+                and outputs.hidden_states[0] is not None
+            )
+
+            if has_hidden_states:
+                # Standard path: model natively supports output_hidden_states.
+                # Move all tensors to a common device for multi-GPU compatibility.
+                hidden_states = cast(
+                    tuple[tuple[FloatTensor]], outputs.hidden_states
+                )[0]
+                residuals = torch.stack(
+                    [
+                        layer_hidden_states[:, -1, :].to(collect_device)
+                        for layer_hidden_states in hidden_states
+                    ],
+                    dim=1,
+                )
+            else:
+                # Fallback path: use hook-collected hidden states.
+                residuals = torch.stack(collected[:n_expected], dim=1)
+        finally:
+            for hook in hooks:
+                hook.remove()
 
         # Upcast the data type to avoid precision (bfloat16) or range (float16)
         # problems during calculations involving residual vectors.

@@ -64,7 +64,9 @@ Heretic have been well-received by users (links and emphasis added):
 > [*(Link to comment)*](https://old.reddit.com/r/LocalLLaMA/comments/1phjxca/im_calling_these_people_out_right_now/nt06tji/)
 
 Heretic supports most dense models, including many multimodal models, and
-several different MoE architectures. It does not yet support SSMs/hybrid models,
+several different MoE architectures. It automatically handles models using
+Float8 (FP8) quantization (e.g., MiniMax M2.5) by converting them to BFloat16
+with proper scale factor application. It does not yet support SSMs/hybrid models,
 models with inhomogeneous layers, and certain novel attention systems.
 
 You can find a small collection of models that have been decensored using Heretic

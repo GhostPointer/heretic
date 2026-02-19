@@ -452,6 +452,50 @@ def run():
     del good_residuals, bad_residuals, analyzer
     empty_cache()
 
+    # Profile MoE router activations to identify safety-critical experts.
+    expert_mask: dict[int, list[int]] | None = None
+
+    if settings.moe_expert_selection and model.get_moe_info(0) is not None:
+        print()
+        print("Profiling MoE router activations...")
+        print("* Profiling with good prompts...")
+        good_activations, good_tokens = model.get_expert_activations_batched(
+            good_prompts
+        )
+        print("* Profiling with bad prompts...")
+        bad_activations, bad_tokens = model.get_expert_activations_batched(
+            bad_prompts
+        )
+
+        # Compute Adversarial Activation Discrepancy (AAD) per expert per layer.
+        # AAD = activation_freq_bad - activation_freq_good
+        # Experts with high AAD are disproportionately involved in processing
+        # refusal-triggering prompts and are candidates for abliteration.
+        expert_mask = {}
+        total_selected = 0
+        total_experts = 0
+
+        for layer_index in good_activations:
+            good_freq = good_activations[layer_index] / max(good_tokens, 1)
+            bad_freq = bad_activations[layer_index] / max(bad_tokens, 1)
+            aad_scores = bad_freq - good_freq
+
+            num_experts = len(aad_scores)
+            n_select = max(1, int(num_experts * settings.moe_expert_fraction))
+            _, top_indices = torch.topk(aad_scores, n_select)
+            expert_mask[layer_index] = top_indices.tolist()
+
+            total_selected += n_select
+            total_experts += num_experts
+
+        print(
+            f"* Selected [bold]{total_selected}[/] / {total_experts} "
+            f"safety-critical experts across all layers"
+        )
+
+        del good_activations, bad_activations
+        empty_cache()
+
     trial_index = 0
     start_index = 0
     start_time = time.perf_counter()
@@ -537,7 +581,7 @@ def run():
         print("* Resetting model...")
         model.reset_model()
         print("* Abliterating...")
-        model.abliterate(refusal_directions, direction_index, parameters)
+        model.abliterate(refusal_directions, direction_index, parameters, expert_mask)
         print("* Evaluating...")
         score, kl_divergence, refusals = evaluator.get_score()
 
@@ -726,6 +770,7 @@ def run():
                     k: AbliterationParameters(**v)
                     for k, v in trial.user_attrs["parameters"].items()
                 },
+                expert_mask,
             )
 
             while True:

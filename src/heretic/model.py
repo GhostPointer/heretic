@@ -515,8 +515,32 @@ class Model:
         # Text-only models.
         return model.model.layers
 
-    def get_layer_modules(self, layer_index: int) -> dict[str, list[Module]]:
+    def get_moe_info(self, layer_index: int) -> tuple[Module, ModuleList] | None:
+        """Returns (gate, experts) for a MoE layer, or None for dense layers."""
         layer = self.get_layers()[layer_index]
+
+        # Qwen3 MoE.
+        with suppress(Exception):
+            return (layer.mlp.gate, layer.mlp.experts)
+
+        # Phi-3.5-MoE, MiniMax.
+        with suppress(Exception):
+            return (layer.block_sparse_moe.gate, layer.block_sparse_moe.experts)
+
+        # Granite MoE.
+        with suppress(Exception):
+            return (layer.moe.gate, layer.moe.experts)
+
+        return None
+
+    def get_layer_modules(
+        self,
+        layer_index: int,
+        expert_mask: dict[int, list[int]] | None = None,
+    ) -> dict[str, list[Module]]:
+        layer = self.get_layers()[layer_index]
+        selected_experts = expert_mask.get(layer_index) if expert_mask else None
+        selected = set(selected_experts) if selected_experts is not None else None
 
         modules = {}
 
@@ -542,13 +566,15 @@ class Model:
 
         # Some MoE models (e.g. Qwen3).
         with suppress(Exception):
-            for expert in layer.mlp.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
+            for i, expert in enumerate(layer.mlp.experts):  # ty:ignore[possibly-missing-attribute, not-iterable]
+                if selected is None or i in selected:
+                    try_add("mlp.down_proj", expert.down_proj)  # ty:ignore[possibly-missing-attribute]
 
         # Phi-3.5-MoE (and possibly others).
         with suppress(Exception):
-            for expert in layer.block_sparse_moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
+            for i, expert in enumerate(layer.block_sparse_moe.experts):  # ty:ignore[possibly-missing-attribute, not-iterable]
+                if selected is None or i in selected:
+                    try_add("mlp.down_proj", expert.w2)  # ty:ignore[possibly-missing-attribute]
 
         # Granite MoE Hybrid - attention layers with shared_mlp.
         with suppress(Exception):
@@ -556,8 +582,9 @@ class Model:
 
         # Granite MoE Hybrid - MoE layers with experts.
         with suppress(Exception):
-            for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
-                try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
+            for i, expert in enumerate(layer.moe.experts):  # ty:ignore[possibly-missing-attribute, not-iterable]
+                if selected is None or i in selected:
+                    try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
@@ -568,11 +595,103 @@ class Model:
     def get_abliterable_components(self) -> list[str]:
         return list(self.get_layer_modules(0).keys())
 
+    def get_expert_activations(
+        self, prompts: list[Prompt]
+    ) -> tuple[dict[int, Tensor], int]:
+        """
+        Profiles MoE router activations to determine which experts are selected
+        for the given prompts. Returns ({layer_index: Tensor(num_experts)}, total_tokens)
+        where the tensor contains per-expert activation counts.
+        """
+        layers = self.get_layers()
+        activation_counts: dict[int, Tensor] = {}
+        token_counts: list[int] = [0]
+        hooks = []
+
+        for layer_index in range(len(layers)):
+            moe_info = self.get_moe_info(layer_index)
+            if moe_info is None:
+                continue
+            gate, experts = moe_info
+            num_experts = len(experts)
+            activation_counts[layer_index] = torch.zeros(num_experts)
+
+            # Read top-k and routing bias from the MoE block
+            # (attribute names vary by architecture).
+            layer = layers[layer_index]
+            top_k = None
+            routing_bias = None
+            for block_attr in ["block_sparse_moe", "mlp", "moe"]:
+                with suppress(Exception):
+                    block = getattr(layer, block_attr)
+                    for attr in ["top_k", "num_experts_per_tok"]:
+                        with suppress(Exception):
+                            top_k = getattr(block, attr)
+                            break
+                    # Some models (e.g. MiniMax) apply a correction bias after
+                    # the activation function but before top-k selection.
+                    with suppress(Exception):
+                        routing_bias = block.e_score_correction_bias
+                    break
+            if top_k is None:
+                top_k = 8  # Fallback default.
+
+            def make_hook(li: int, ne: int, k: int, bias: Tensor | None):  # ty:ignore[no-any-explicit]
+                def hook_fn(module: Module, args: tuple, output: Tensor) -> None:  # ty:ignore[no-any-explicit]
+                    # Gate output shape: (batch*seq, num_experts) - raw logits.
+                    # When a routing bias exists (e.g. MiniMax e_score_correction_bias),
+                    # we must apply sigmoid + bias to replicate the actual top-k selection.
+                    # Without bias, raw logits suffice since activation functions are monotonic.
+                    scores = output.float()
+                    if bias is not None:
+                        scores = torch.sigmoid(scores) + bias.float().to(scores.device)
+                    n_tokens = scores.shape[0]
+                    if li == 0:
+                        token_counts[0] += n_tokens
+                    _, top_indices = torch.topk(scores, k, dim=-1)
+                    counts = torch.bincount(
+                        top_indices.reshape(-1).to(torch.int64), minlength=ne
+                    ).float().cpu()
+                    activation_counts[li] += counts
+
+                return hook_fn
+
+            hooks.append(gate.register_forward_hook(make_hook(layer_index, num_experts, top_k, routing_bias)))
+
+        if not hooks:
+            return {}, 0
+
+        try:
+            self.generate(prompts, max_new_tokens=1)
+        finally:
+            for hook in hooks:
+                hook.remove()
+
+        return activation_counts, token_counts[0]
+
+    def get_expert_activations_batched(
+        self, prompts: list[Prompt]
+    ) -> tuple[dict[int, Tensor], int]:
+        """Batched version of get_expert_activations."""
+        combined_counts: dict[int, Tensor] = {}
+        total_tokens = 0
+
+        for batch in batchify(prompts, self.settings.batch_size):
+            batch_counts, batch_tokens = self.get_expert_activations(batch)
+            total_tokens += batch_tokens
+            for layer_index, counts in batch_counts.items():
+                if layer_index not in combined_counts:
+                    combined_counts[layer_index] = torch.zeros_like(counts)
+                combined_counts[layer_index] += counts
+
+        return combined_counts, total_tokens
+
     def abliterate(
         self,
         refusal_directions: Tensor,
         direction_index: float | None,
         parameters: dict[str, AbliterationParameters],
+        expert_mask: dict[int, list[int]] | None = None,
     ):
         if direction_index is None:
             refusal_direction = None
@@ -592,7 +711,7 @@ class Model:
         # Note that some implementations of abliteration also orthogonalize
         # the embedding matrix, but it's unclear if that has any benefits.
         for layer_index in range(len(self.get_layers())):
-            for component, modules in self.get_layer_modules(layer_index).items():
+            for component, modules in self.get_layer_modules(layer_index, expert_mask).items():
                 params = parameters[component]
 
                 # Type inference fails here for some reason.

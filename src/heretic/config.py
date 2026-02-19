@@ -204,6 +204,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    moe_expert_selection: bool = Field(
+        default=True,
+        description=(
+            "Whether to profile MoE router activations and only abliterate "
+            "safety-critical experts. Only applies to Mixture-of-Experts models. "
+            "When disabled, all experts are abliterated (original behavior)."
+        ),
+    )
+
+    moe_expert_fraction: float = Field(
+        default=0.1,
+        description=(
+            "Fraction of MoE experts to identify as safety-critical and abliterate, "
+            "ranked by Adversarial Activation Discrepancy (AAD). "
+            "For a model with 256 experts, 0.1 means the top ~26 experts per layer."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(

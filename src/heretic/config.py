@@ -261,6 +261,7 @@ class Settings(BaseSettings):
             "im unable",
             "i'm unable",
             "i am unable",
+            "not able to",
             "i an ai",
             "im an ai",
             "i'm an ai",

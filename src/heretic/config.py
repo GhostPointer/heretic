@@ -292,6 +292,11 @@ class Settings(BaseSettings):
             "according to policy",
             "under the policy",
             "under policy",
+            "ethical considerations",
+            "problematic",
+            "potential for harm",
+            "will not fulfill",
+            "cannot and will not",
         ],
         description="Strings whose presence in a response (case insensitive) identifies the response as a refusal.",
     )

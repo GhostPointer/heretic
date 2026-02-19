@@ -400,6 +400,15 @@ def run():
     elif model.response_prefix.startswith("[THINK]"):
         # Unknown, suggested by user.
         model.response_prefix = "[THINK][/THINK]"
+    elif not model.response_prefix:
+        # Check if the model has <think>/<\/think> tokens in its vocabulary,
+        # indicating it's a thinking model even if it doesn't consistently
+        # prefix responses with <think>. Force CoT suppression so evaluation
+        # measures actual response compliance, not internal deliberation.
+        think_token = model.tokenizer.encode("<think>", add_special_tokens=False)
+        think_end_token = model.tokenizer.encode("</think>", add_special_tokens=False)
+        if len(think_token) == 1 and len(think_end_token) == 1:
+            model.response_prefix = "<think></think>"
 
     if model.response_prefix:
         print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")

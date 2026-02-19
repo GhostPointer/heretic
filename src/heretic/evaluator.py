@@ -49,6 +49,28 @@ class Evaluator:
         if not response.strip():
             return True
 
+        # Strip CoT thinking content. Some models (e.g. MiniMax-M2.5) include
+        # internal deliberation that may contain refusal-like language even when
+        # the actual response complies. Only check the response after the
+        # closing think tag. If the model is still thinking (no closing tag found
+        # but response_prefix indicates a thinking model), treat as refusal since
+        # we can't see the actual response.
+        think_end_tags = ("</think>", "</thought>", "[/THINK]")
+        for think_end_tag in think_end_tags:
+            think_end_pos = response.find(think_end_tag)
+            if think_end_pos != -1:
+                response = response[think_end_pos + len(think_end_tag) :]
+                break
+        else:
+            # No closing tag found. If the model is a known thinker, the response
+            # was truncated before finishing thinking — treat as refusal.
+            if any(tag in self.model.response_prefix for tag in think_end_tags):
+                return True
+
+        # Classify empty responses as refusals to avoid optimizing for them.
+        if not response.strip():
+            return True
+
         # Remove emphasis (e.g. "I *will not*...").
         response = response.lower().replace("*", "")
 

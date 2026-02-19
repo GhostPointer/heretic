@@ -144,7 +144,7 @@ class Model:
                             user="What is 1+1?",
                         )
                     ],
-                    max_new_tokens=1,
+                    max_new_tokens=500,
                 )
 
                 if settings.print_responses:

@@ -219,20 +219,15 @@ class Model:
             task_type="CAUSAL_LM",
         )
 
+        # FP8Linear layers are incompatible with PEFT's LoRA wrapper: PEFT copies
+        # the base layer's dtype (Float8_e4m3fn) for the LoRA A/B matrices, and
+        # standard CUDA kernels (addmm) don't support FP8. Convert FP8 target
+        # modules to BF16 Linear before applying LoRA so PEFT never sees FP8.
+        self._convert_fp8_lora_targets_to_bf16(target_modules)
+
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
-
-        # PEFT matches LoRA weight dtype to the base layer weight dtype. When the base
-        # layer uses FP8 (Float8_e4m3fn), the LoRA A/B matrices also become FP8, but
-        # standard CUDA kernels (addmm) don't support FP8. Cast them to bfloat16.
-        if self._has_fp8_layers():
-            for name, param in self.model.named_parameters():
-                if "lora_" in name and param.data.dtype in (
-                    torch.float8_e4m3fn,
-                    torch.float8_e5m2,
-                ):
-                    param.data = param.data.to(torch.bfloat16)
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
 
@@ -305,6 +300,79 @@ class Model:
         empty_cache()
         print("* FP8 to BF16 conversion complete")
 
+    def _convert_fp8_lora_targets_to_bf16(self, target_modules: list[str]) -> None:
+        """
+        Converts FP8Linear layers that will be wrapped by LoRA to BF16 Linear layers.
+
+        PEFT copies the base layer's weight dtype for LoRA A/B matrices. When the base
+        layer uses FP8 (Float8_e4m3fn), the LoRA weights also become FP8 and standard
+        CUDA matmul kernels (addmm) fail. Converting targets to BF16 before PEFT wrapping
+        avoids this entirely.
+        """
+        target_set = set(target_modules)
+        fp8_targets = [
+            (name, module)
+            for name, module in self.model.named_modules()
+            if "FP8Linear" in module.__class__.__name__
+            and name.rsplit(".", 1)[-1] in target_set
+        ]
+
+        if not fp8_targets:
+            return
+
+        print(
+            f"* Converting [bold]{len(fp8_targets)}[/] FP8 LoRA target layers to BF16..."
+        )
+
+        for name, module in fp8_targets:
+            new_layer = nn.Linear(
+                module.in_features,
+                module.out_features,
+                bias=module.bias is not None,
+                dtype=torch.bfloat16,
+                device=module.weight.device,
+            )
+
+            with torch.no_grad():
+                shim = Module()
+                shim.base_layer = module  # ty:ignore[unresolved-attribute]
+                weight_data = Model._dequantize_weight(shim)
+                new_layer.weight.copy_(weight_data.to(torch.bfloat16))
+
+                if module.bias is not None:
+                    new_layer.bias.copy_(module.bias.data.float().to(torch.bfloat16))
+
+            if "." in name:
+                parent_name, child_name = name.rsplit(".", 1)
+                parent = self.model.get_submodule(parent_name)
+            else:
+                child_name = name
+                parent = self.model
+            setattr(parent, child_name, new_layer)
+
+        empty_cache()
+
+    @staticmethod
+    def _infer_block_size(weight_dim: int, scale_dim: int) -> int:
+        """
+        Infer the FP8 quantization block size from weight and scale dimensions.
+
+        FP8 block-wise quantization uses a fixed block size (e.g., 128) for all blocks
+        except the last, which may be smaller. Given ``scale_dim = ceil(weight_dim / block_size)``,
+        recover the original block size.
+        """
+        if weight_dim % scale_dim == 0:
+            return weight_dim // scale_dim
+
+        # Try common FP8 block sizes used by quantization libraries.
+        for bs in [128, 64, 256, 32, 512]:
+            if math.ceil(weight_dim / bs) == scale_dim:
+                return bs
+
+        # Fallback: ceil division. Correct when weight_dim is a multiple of the
+        # true block size, but may misalign the last block otherwise.
+        return math.ceil(weight_dim / scale_dim)
+
     @staticmethod
     def _dequantize_weight(module: Module) -> Tensor:
         """
@@ -319,12 +387,17 @@ class Model:
         base_weight = cast(Tensor, base_layer.weight)
 
         # FP8 with block-wise scaling.
-        # Identify the scale attribute name by inspecting the module.
+        # Only probe for scale attributes on actual FP8 modules to avoid
+        # false positives from unrelated attributes (e.g., "scale" on
+        # attention layers or custom modules).
+        is_fp8 = "FP8" in base_layer.__class__.__name__
+
         scale_attr = None
-        for attr in ["weight_scale", "scale", "w_scale", "weight_scale_inv"]:
-            if hasattr(base_layer, attr):
-                scale_attr = attr
-                break
+        if is_fp8:
+            for attr in ["weight_scale", "weight_scale_inv", "w_scale", "scale"]:
+                if hasattr(base_layer, attr):
+                    scale_attr = attr
+                    break
 
         if scale_attr is not None:
             weight_data = base_weight.data.float()
@@ -346,18 +419,37 @@ class Model:
 
             # Handle block-wise scaling (e.g., 128x128 blocks).
             if scale.dim() == 2 and weight_data.dim() == 2 and scale.shape != weight_data.shape:
-                block_rows = math.ceil(weight_data.shape[0] / scale.shape[0])
-                block_cols = math.ceil(weight_data.shape[1] / scale.shape[1])
+                # Infer the actual quantization block size rather than assuming
+                # uniform distribution. FP8 quantizers use a fixed block size
+                # (e.g., 128) for all blocks except the last remainder block.
+                bs_r = Model._infer_block_size(weight_data.shape[0], scale.shape[0])
+                bs_c = Model._infer_block_size(weight_data.shape[1], scale.shape[1])
 
-                scale_expanded = torch.repeat_interleave(scale, block_rows, dim=0)
-                scale_expanded = torch.repeat_interleave(scale_expanded, block_cols, dim=1)
+                # Map each weight position to its scale block via integer division.
+                row_idx = torch.arange(
+                    weight_data.shape[0], device=scale.device
+                ) // bs_r
+                col_idx = torch.arange(
+                    weight_data.shape[1], device=scale.device
+                ) // bs_c
 
-                if scale_expanded.shape != weight_data.shape:
-                    scale_expanded = scale_expanded[:weight_data.shape[0], :weight_data.shape[1]]
+                # Clamp to handle the last (potentially smaller) block.
+                row_idx.clamp_(max=scale.shape[0] - 1)
+                col_idx.clamp_(max=scale.shape[1] - 1)
+
+                scale_expanded = scale[row_idx][:, col_idx]
 
                 return weight_data * scale_expanded
             else:
                 return weight_data * scale
+
+        # FP8 layer without a recognized scale attribute — the raw FP8 bytes
+        # cannot be meaningfully interpreted as float32 without scaling.
+        if is_fp8:
+            print(
+                f"[yellow]Warning: FP8 module {base_layer.__class__.__name__} has no "
+                "recognized scale attribute, dequantized weights may be inaccurate[/]"
+            )
 
         # BitsAndBytes 4-bit quantization.
         quant_state = getattr(base_weight, "quant_state", None)

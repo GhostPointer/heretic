@@ -126,8 +126,8 @@ class Model:
                 if self.trusted_models.get(settings.model) is None:
                     self.trusted_models[settings.model] = True
 
-                # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
-                self._convert_fp8_to_bf16()
+                # Detect FP8 layers (kept in FP8 for efficient inference).
+                self._detect_fp8()
 
                 # Some trust_remote_code models wrap forward() with decorators
                 # that reject standard HuggingFace kwargs (e.g., input_ids).
@@ -136,7 +136,7 @@ class Model:
                 # A test run can reveal dtype-related problems such as the infamous
                 # "RuntimeError: probability tensor contains either `inf`, `nan` or element < 0"
                 # (https://github.com/meta-llama/llama/issues/380).
-                # It also validates the FP8 to BF16 conversion if applicable.
+                # It also validates that FP8 inference works correctly if applicable.
                 inputs, outputs = self.generate(
                     [
                         Prompt(
@@ -225,13 +225,30 @@ class Model:
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
 
-    def _convert_fp8_to_bf16(self) -> None:
+    def _detect_fp8(self) -> None:
         """
-        Converts FP8Linear layers to standard BFloat16 Linear layers with proper scaling.
+        Detects FP8Linear layers and logs their presence.
 
-        Some models (e.g., MiniMax M2.5) use Float8_e4m3fn quantization which requires
-        special handling. This method identifies FP8Linear layers, applies their scale
-        factors (including block-wise scaling), and converts them to standard BF16 layers.
+        FP8Linear layers (e.g., from MiniMax M2.5) are kept as-is for inference —
+        PEFT's standard LoRA wrapper calls FP8Linear.forward() which uses efficient
+        Triton FP8 kernels. Dequantization only happens on-the-fly in abliterate()
+        when weight matrices need to be read for LoRA computation.
+        """
+        fp8_count = sum(
+            1
+            for _, module in self.model.named_modules()
+            if "FP8Linear" in module.__class__.__name__
+        )
+
+        if fp8_count > 0:
+            print(f"* Detected [bold]{fp8_count}[/] FP8 layers (kept in FP8 for inference)")
+
+    def _convert_fp8_to_bf16_for_merge(self) -> None:
+        """
+        Converts FP8Linear layers to standard BFloat16 Linear layers.
+
+        Only used when merging LoRA adapters into base weights for saving,
+        since the saved model needs standard weight tensors.
         """
         fp8_module_names = [
             name
@@ -242,34 +259,7 @@ class Model:
         if not fp8_module_names:
             return
 
-        print(f"* Converting {len(fp8_module_names)} FP8 layers to BF16...")
-
-        # Identify the scale attribute name by inspecting the first module.
-        scale_attr = None
-        first_module = self.model.get_submodule(fp8_module_names[0])
-        for attr in ["weight_scale", "scale", "w_scale", "weight_scale_inv"]:
-            if hasattr(first_module, attr):
-                scale_attr = attr
-                break
-
-        if scale_attr is None:
-            print("[yellow]Warning: no scale attribute found on FP8 modules, weights may be inaccurate[/]")
-
-        # Determine if the scale needs to be inverted for dequantization.
-        # Most attributes store the dequantization factor directly (multiply to dequant).
-        # "weight_scale_inv" is ambiguous across libraries:
-        #   - transformer_engine, msamp: it IS the dequant factor (multiply)
-        #   - HuggingFace finegrained_fp8: it IS the dequant factor (multiply)
-        #     (the Triton kernel does: accumulator += dot(a, b) * a_s * b_s)
-        #   - Other conventions: it may be 1/dequant_factor (need to invert)
-        invert_scale = False
-        if scale_attr == "weight_scale_inv":
-            module_origin = first_module.__class__.__module__ or ""
-            if not any(
-                lib in module_origin
-                for lib in ("transformer_engine", "msamp", "finegrained_fp8", "transformers")
-            ):
-                invert_scale = True
+        print(f"* Converting {len(fp8_module_names)} FP8 layers to BF16 for merge...")
 
         for name in fp8_module_names:
             module = self.model.get_submodule(name)
@@ -282,42 +272,17 @@ class Model:
             )
 
             with torch.no_grad():
-                # Cast FP8 weights to float32 for processing.
-                weight_data = module.weight.data.float()
-
-                # Apply scaling if available.
-                if scale_attr and hasattr(module, scale_attr):
-                    scale = getattr(module, scale_attr).float().to(weight_data.device)
-                    if invert_scale:
-                        scale = 1.0 / scale
-
-                    # Handle block-wise scaling (e.g., 128x128 blocks).
-                    if scale.dim() == 2 and weight_data.dim() == 2 and scale.shape != weight_data.shape:
-                        block_rows = math.ceil(weight_data.shape[0] / scale.shape[0])
-                        block_cols = math.ceil(weight_data.shape[1] / scale.shape[1])
-
-                        # Expand scale to match weight shape.
-                        scale_expanded = torch.repeat_interleave(scale, block_rows, dim=0)
-                        scale_expanded = torch.repeat_interleave(scale_expanded, block_cols, dim=1)
-
-                        # Crop if dimensions don't align perfectly.
-                        if scale_expanded.shape != weight_data.shape:
-                            scale_expanded = scale_expanded[:weight_data.shape[0], :weight_data.shape[1]]
-
-                        weight_data = weight_data * scale_expanded
-                    else:
-                        # Scalar or element-wise scaling (broadcasting handles both).
-                        weight_data = weight_data * scale
-
-                # Store as BF16.
+                # Reuse the dequantization logic. _dequantize_weight expects a
+                # LoRA-wrapped module with a base_layer attribute, so we create
+                # a lightweight shim that points to the raw FP8 module.
+                shim = Module()
+                shim.base_layer = module  # ty:ignore[unresolved-attribute]
+                weight_data = Model._dequantize_weight(shim)
                 new_layer.weight.copy_(weight_data.to(torch.bfloat16))
 
                 if module.bias is not None:
-                    if module.bias.data.is_floating_point() and module.bias.data.element_size() == 1:
-                        print(f"[yellow]Warning: bias of {name} appears to be FP8 and may need scaling[/]")
                     new_layer.bias.copy_(module.bias.data.float().to(torch.bfloat16))
 
-            # Replace the FP8 layer with the new BF16 layer.
             if "." in name:
                 parent_name, child_name = name.rsplit(".", 1)
                 parent = self.model.get_submodule(parent_name)
@@ -328,6 +293,74 @@ class Model:
 
         empty_cache()
         print("* FP8 to BF16 conversion complete")
+
+    @staticmethod
+    def _dequantize_weight(module: Module) -> Tensor:
+        """
+        Get the float32 weight matrix from a LoRA-wrapped module.
+
+        Handles three cases:
+        - FP8 with block-wise scaling (e.g., MiniMax M2.5)
+        - BitsAndBytes 4-bit quantization
+        - Standard float weights (BF16/FP16/FP32)
+        """
+        base_layer = module.base_layer  # ty:ignore[unresolved-attribute]
+        base_weight = cast(Tensor, base_layer.weight)
+
+        # FP8 with block-wise scaling.
+        # Identify the scale attribute name by inspecting the module.
+        scale_attr = None
+        for attr in ["weight_scale", "scale", "w_scale", "weight_scale_inv"]:
+            if hasattr(base_layer, attr):
+                scale_attr = attr
+                break
+
+        if scale_attr is not None:
+            weight_data = base_weight.data.float()
+            scale = getattr(base_layer, scale_attr).float().to(weight_data.device)
+
+            # Determine if the scale needs to be inverted for dequantization.
+            # Most attributes store the dequantization factor directly (multiply).
+            # "weight_scale_inv" is ambiguous across libraries:
+            #   - transformer_engine, msamp: it IS the dequant factor (multiply)
+            #   - HuggingFace finegrained_fp8: it IS the dequant factor (multiply)
+            #   - Other conventions: it may be 1/dequant_factor (need to invert)
+            if scale_attr == "weight_scale_inv":
+                module_origin = base_layer.__class__.__module__ or ""
+                if not any(
+                    lib in module_origin
+                    for lib in ("transformer_engine", "msamp", "finegrained_fp8", "transformers")
+                ):
+                    scale = 1.0 / scale
+
+            # Handle block-wise scaling (e.g., 128x128 blocks).
+            if scale.dim() == 2 and weight_data.dim() == 2 and scale.shape != weight_data.shape:
+                block_rows = math.ceil(weight_data.shape[0] / scale.shape[0])
+                block_cols = math.ceil(weight_data.shape[1] / scale.shape[1])
+
+                scale_expanded = torch.repeat_interleave(scale, block_rows, dim=0)
+                scale_expanded = torch.repeat_interleave(scale_expanded, block_cols, dim=1)
+
+                if scale_expanded.shape != weight_data.shape:
+                    scale_expanded = scale_expanded[:weight_data.shape[0], :weight_data.shape[1]]
+
+                return weight_data * scale_expanded
+            else:
+                return weight_data * scale
+
+        # BitsAndBytes 4-bit quantization.
+        quant_state = getattr(base_weight, "quant_state", None)
+        if quant_state is not None:
+            return cast(
+                Tensor,
+                bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
+                    base_weight.data,
+                    quant_state,
+                ).to(torch.float32),
+            )
+
+        # Standard float weights.
+        return base_weight.to(torch.float32)
 
     def _unwrap_restrictive_forward_decorators(self) -> None:
         """
@@ -399,15 +432,25 @@ class Model:
             )
         return None
 
+    def _has_fp8_layers(self) -> bool:
+        """Check if the model contains FP8Linear layers."""
+        model = self.model
+        if isinstance(model, PeftModel):
+            model = model.base_model.model
+        return any(
+            "FP8Linear" in module.__class__.__name__
+            for _, module in model.named_modules()
+        )
+
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
 
-        # Check if we need special handling for quantized models
-        if self.settings.quantization == QuantizationMethod.BNB_4BIT:
-            # Quantized models need special handling - we must reload the base model
-            # in full precision to merge the LoRA adapters
-
+        # Quantized models (BNB 4-bit) and FP8 models need special handling:
+        # we must reload the base model in full precision to merge the LoRA adapters,
+        # because merge_and_unload() adds the delta directly to base weights, which
+        # doesn't work with quantized or FP8 weight formats.
+        if self.settings.quantization == QuantizationMethod.BNB_4BIT or self._has_fp8_layers():
             # Get the adapter state dict before we do anything
             adapter_state = {}
             for name, param in self.model.named_parameters():
@@ -424,8 +467,8 @@ class Model:
                 trust_remote_code=self.trusted_models.get(self.settings.model),
             )
 
-            # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
-            self._convert_fp8_to_bf16()
+            # Convert FP8 layers to BF16 for merging (the saved model needs standard weights).
+            self._convert_fp8_to_bf16_for_merge()
             self._unwrap_restrictive_forward_decorators()
 
             base_model = self.model
@@ -493,8 +536,8 @@ class Model:
             **extra_kwargs,
         )
 
-        # Convert FP8 layers to BF16 if needed (e.g., for MiniMax M2.5).
-        self._convert_fp8_to_bf16()
+        # Detect FP8 layers (kept in FP8 for efficient inference).
+        self._detect_fp8()
         self._unwrap_restrictive_forward_decorators()
 
         self._apply_lora()
@@ -737,7 +780,7 @@ class Model:
 
                 for module in modules:
                     # Defensive fallback for modules without LoRA adapters.
-                    # Under normal flow, _convert_fp8_to_bf16() + _apply_lora() wraps
+                    # Under normal flow, _apply_lora() wraps
                     # all targeted modules, so this should not trigger. It exists as a
                     # safeguard in case PEFT fails to match a module by name.
                     if not hasattr(module, "base_layer"):
@@ -748,6 +791,16 @@ class Model:
                         assert not self.needs_reload, (
                             "Module without LoRA adapter has already been directly modified. "
                             "Call reset_model() before re-abliterating."
+                        )
+                        # FP8 modules cannot be modified in-place (need scale factors
+                        # for dequantization and re-quantization is lossy). This fallback
+                        # only works for standard float modules.
+                        assert not any(
+                            hasattr(module, attr)
+                            for attr in ("weight_scale_inv", "weight_scale", "w_scale")
+                        ), (
+                            f"FP8 module {module.__class__.__name__} has no LoRA adapter. "
+                            "Direct weight modification is not supported for FP8 layers."
                         )
                         self.needs_reload = True
                         v = layer_refusal_direction.to(module.weight.device)
@@ -793,26 +846,8 @@ class Model:
                     v = layer_refusal_direction.to(module.weight.device)
 
                     # Get W (dequantize if necessary).
-                    #
-                    # FIXME: This cast is valid only under the assumption that the original
-                    #        module wrapped by the LoRA adapter has a weight attribute.
-                    #        See the comment above for why this is currently not guaranteed.
-                    base_weight = cast(Tensor, module.base_layer.weight)
-                    quant_state = getattr(base_weight, "quant_state", None)
-
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
-                        # This cast is always valid. Type inference fails here because the
-                        # bnb.functional module is not found by ty for some reason.
-                        W = cast(
-                            Tensor,
-                            bnb.functional.dequantize_4bit(  # ty:ignore[possibly-missing-attribute]
-                                base_weight.data,
-                                quant_state,
-                            ).to(torch.float32),
-                        )
+                    # Handles FP8 (block-wise scaling), BNB 4-bit, and standard weights.
+                    W = self._dequantize_weight(module)
 
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)

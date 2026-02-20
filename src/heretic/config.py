@@ -306,6 +306,7 @@ class Settings(BaseSettings):
             "safety concerns",
             "malicious code",
             "significant harm",
+            "legitimate approaches",
         ],
         description="Strings whose presence in a response (case insensitive) identifies the response as a refusal.",
     )

@@ -223,6 +223,17 @@ class Model:
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
+        # PEFT matches LoRA weight dtype to the base layer weight dtype. When the base
+        # layer uses FP8 (Float8_e4m3fn), the LoRA A/B matrices also become FP8, but
+        # standard CUDA kernels (addmm) don't support FP8. Cast them to bfloat16.
+        if self._has_fp8_layers():
+            for name, param in self.model.named_parameters():
+                if "lora_" in name and param.data.dtype in (
+                    torch.float8_e4m3fn,
+                    torch.float8_e5m2,
+                ):
+                    param.data = param.data.to(torch.bfloat16)
+
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
 
     def _detect_fp8(self) -> None:

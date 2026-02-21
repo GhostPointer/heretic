@@ -747,19 +747,12 @@ class Model:
         """
         Profiles MoE router activations to determine which experts are selected
         for the given prompts. Returns ({layer_index: Tensor(num_experts)}, total_tokens)
-        where the tensor contains per-expert activation weights (or counts if
-        weighted scoring is disabled).
-
-        When weighted scoring is enabled (moe_weighted_scoring=True), each expert
-        accumulates its raw sigmoid routing weight instead of a binary +1 count.
-        This captures both selection frequency and selection confidence, improving
-        expert importance estimation for AAD-based expert selection.
+        where the tensor contains per-expert activation counts.
         """
         layers = self.get_layers()
         activation_counts: dict[int, Tensor] = {}
         token_counts: list[int] = [0]
         hooks = []
-        weighted = self.settings.moe_weighted_scoring
 
         for layer_index in range(len(layers)):
             moe_info = self.get_moe_info(layer_index)
@@ -792,46 +785,20 @@ class Model:
             def make_hook(li: int, ne: int, k: int, bias: Tensor | None):  # ty:ignore[no-any-explicit]
                 def hook_fn(module: Module, args: tuple, output: Tensor) -> None:  # ty:ignore[no-any-explicit]
                     # Gate output shape: (batch*seq, num_experts) - raw logits.
+                    # When a routing bias exists (e.g. MiniMax e_score_correction_bias),
+                    # we must apply sigmoid + bias to replicate the actual top-k selection.
+                    # Without bias, raw logits suffice since activation functions are monotonic.
                     scores = output.float()
-                    if weighted:
-                        # Always apply sigmoid to get meaningful routing weights.
-                        # The sigmoid values represent actual routing confidence.
-                        routing_weights = torch.sigmoid(scores)
-                        # Use sigmoid + bias for top-k selection (replicates actual routing).
-                        if bias is not None:
-                            selection_scores = routing_weights + bias.float().to(scores.device)
-                        else:
-                            selection_scores = routing_weights
-                        n_tokens = scores.shape[0]
-                        if li == 0:
-                            token_counts[0] += n_tokens
-                        top_weights, top_indices = torch.topk(selection_scores, k, dim=-1)
-                        # Gather the raw sigmoid weights (not bias-adjusted) for selected experts,
-                        # matching MiniMax's actual routing which uses original sigmoid weights.
-                        top_weights = routing_weights.gather(1, top_indices)
-                        # Accumulate actual routing weights per expert via scatter_add.
-                        weighted_counts = torch.zeros(ne, device=scores.device)
-                        weighted_counts.scatter_add_(
-                            0,
-                            top_indices.reshape(-1).to(torch.int64),
-                            top_weights.reshape(-1),
-                        )
-                        activation_counts[li] += weighted_counts.cpu()
-                    else:
-                        # Binary counting: each selected expert gets +1.
-                        # When a routing bias exists (e.g. MiniMax e_score_correction_bias),
-                        # we must apply sigmoid + bias to replicate the actual top-k selection.
-                        # Without bias, raw logits suffice since activation functions are monotonic.
-                        if bias is not None:
-                            scores = torch.sigmoid(scores) + bias.float().to(scores.device)
-                        n_tokens = scores.shape[0]
-                        if li == 0:
-                            token_counts[0] += n_tokens
-                        _, top_indices = torch.topk(scores, k, dim=-1)
-                        counts = torch.bincount(
-                            top_indices.reshape(-1).to(torch.int64), minlength=ne
-                        ).float().cpu()
-                        activation_counts[li] += counts
+                    if bias is not None:
+                        scores = torch.sigmoid(scores) + bias.float().to(scores.device)
+                    n_tokens = scores.shape[0]
+                    if li == 0:
+                        token_counts[0] += n_tokens
+                    _, top_indices = torch.topk(scores, k, dim=-1)
+                    counts = torch.bincount(
+                        top_indices.reshape(-1).to(torch.int64), minlength=ne
+                    ).float().cpu()
+                    activation_counts[li] += counts
 
                 return hook_fn
 

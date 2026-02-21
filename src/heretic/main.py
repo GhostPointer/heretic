@@ -388,18 +388,66 @@ def run():
     model.response_prefix = commonprefix(responses).rstrip(" ")
 
     # Suppress CoT output.
+    # Detect if the chat template's generation prompt already includes an opening
+    # think tag. If so, the response prefix must only contain the closing tag to
+    # avoid malformed duplication (e.g. "<think>\n<think></think>").
+    generation_prompt = model.tokenizer.apply_chat_template(
+        [{"role": "user", "content": "test"}],
+        add_generation_prompt=True,
+        tokenize=False,
+    )
+    gen_prompt_tail = generation_prompt.rstrip()
+
+    # Map of (opening tag, closing tag) pairs for known thinking formats.
+    think_tags = [
+        ("<think>", "</think>"),
+        ("<thought>", "</thought>"),
+        ("[THINK]", "[/THINK]"),
+    ]
+
+    # Check which tag (if any) the template already includes.
+    template_think_tag = None
+    for open_tag, close_tag in think_tags:
+        if gen_prompt_tail.endswith(open_tag):
+            template_think_tag = (open_tag, close_tag)
+            break
+
+    if template_think_tag:
+        print(
+            f"* Chat template already includes [bold]{template_think_tag[0]!r}[/] "
+            "in generation prompt"
+        )
+
     if model.response_prefix.startswith("<think>"):
-        # Most thinking models.
-        model.response_prefix = "<think></think>"
+        if template_think_tag and template_think_tag[0] == "<think>":
+            print(
+                "* [yellow]Avoiding duplicate <think> tag:[/] "
+                "using [bold]'</think>'[/] instead of [bold]'<think></think>'[/]"
+            )
+            model.response_prefix = "</think>"
+        else:
+            model.response_prefix = "<think></think>"
     elif model.response_prefix.startswith("<|channel|>analysis<|message|>"):
         # gpt-oss.
         model.response_prefix = "<|channel|>analysis<|message|><|end|><|start|>assistant<|channel|>final<|message|>"
     elif model.response_prefix.startswith("<thought>"):
-        # Unknown, suggested by user.
-        model.response_prefix = "<thought></thought>"
+        if template_think_tag and template_think_tag[0] == "<thought>":
+            print(
+                "* [yellow]Avoiding duplicate <thought> tag:[/] "
+                "using [bold]'</thought>'[/] instead of [bold]'<thought></thought>'[/]"
+            )
+            model.response_prefix = "</thought>"
+        else:
+            model.response_prefix = "<thought></thought>"
     elif model.response_prefix.startswith("[THINK]"):
-        # Unknown, suggested by user.
-        model.response_prefix = "[THINK][/THINK]"
+        if template_think_tag and template_think_tag[0] == "[THINK]":
+            print(
+                "* [yellow]Avoiding duplicate [THINK] tag:[/] "
+                "using [bold]'[/THINK]'[/] instead of [bold]'[THINK][/THINK]'[/]"
+            )
+            model.response_prefix = "[/THINK]"
+        else:
+            model.response_prefix = "[THINK][/THINK]"
     elif not model.response_prefix:
         # Check if the model has <think>/<\/think> tokens in its vocabulary,
         # indicating it's a thinking model even if it doesn't consistently
@@ -408,12 +456,19 @@ def run():
         think_token = model.tokenizer.encode("<think>", add_special_tokens=False)
         think_end_token = model.tokenizer.encode("</think>", add_special_tokens=False)
         if len(think_token) == 1 and len(think_end_token) == 1:
-            model.response_prefix = "<think></think>"
+            if template_think_tag and template_think_tag[0] == "<think>":
+                print(
+                    "* [yellow]Avoiding duplicate <think> tag:[/] "
+                    "using [bold]'</think>'[/] instead of [bold]'<think></think>'[/]"
+                )
+                model.response_prefix = "</think>"
+            else:
+                model.response_prefix = "<think></think>"
 
     if model.response_prefix:
-        print(f"* Prefix found: [bold]{model.response_prefix!r}[/]")
+        print(f"* Response prefix: [bold]{model.response_prefix!r}[/]")
     else:
-        print("* None found")
+        print("* No response prefix found")
 
     evaluator = Evaluator(settings, model)
 

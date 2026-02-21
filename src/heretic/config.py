@@ -222,6 +222,18 @@ class Settings(BaseSettings):
         ),
     )
 
+    moe_weighted_scoring: bool = Field(
+        default=True,
+        description=(
+            "Use weighted expert scoring for AAD computation instead of binary activation "
+            "counting. When enabled, each expert accumulates its sigmoid routing weight "
+            "rather than a binary +1 count, capturing both selection frequency and routing "
+            "confidence. This improves expert importance estimation, especially for models "
+            "with many experts (e.g. 256) where binary counting may miss experts that are "
+            "selected equally often but with very different routing weights."
+        ),
+    )
+
     winsorization_quantile: float = Field(
         default=1.0,
         description=(
